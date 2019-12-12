@@ -386,20 +386,20 @@ impl<T> Receiver<T> {
     ///     s.send(2).await;
     /// });
     ///
-    /// assert_eq!(r.recv().await, Some(1));
-    /// assert_eq!(r.recv().await, Some(2));
-    /// assert_eq!(r.recv().await, None);
+    /// assert_eq!(r.recv().await, Ok(1));
+    /// assert_eq!(r.recv().await, Ok(2));
+    /// assert!(r.recv().await.is_err());
     /// #
     /// # })
     /// ```
-    pub async fn recv(&self) -> Option<T> {
+    pub async fn recv(&self) -> Result<T, RecvError> {
         struct RecvFuture<'a, T> {
             channel: &'a Channel<T>,
             opt_key: Option<usize>,
         }
 
         impl<T> Future for RecvFuture<'_, T> {
-            type Output = Option<T>;
+            type Output = Result<T, RecvError>;
 
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 poll_recv(
@@ -565,12 +565,13 @@ impl<T> Stream for Receiver<T> {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
-        poll_recv(
+        let res = futures_core::ready!(poll_recv(
             &this.channel,
             &this.channel.stream_wakers,
             &mut this.opt_key,
             cx,
-        )
+        ));
+        Poll::Ready(res.ok())
     }
 }
 
@@ -589,7 +590,7 @@ fn poll_recv<T>(
     wakers: &WakerSet,
     opt_key: &mut Option<usize>,
     cx: &mut Context<'_>,
-) -> Poll<Option<T>> {
+) -> Poll<Result<T, RecvError>> {
     loop {
         // If the current task is in the set, remove it.
         if let Some(key) = opt_key.take() {
@@ -598,8 +599,8 @@ fn poll_recv<T>(
 
         // Try receiving a message.
         match channel.try_recv() {
-            Ok(msg) => return Poll::Ready(Some(msg)),
-            Err(TryRecvError::Disconnected) => return Poll::Ready(None),
+            Ok(msg) => return Poll::Ready(Ok(msg)),
+            Err(TryRecvError::Disconnected) => return Poll::Ready(Err(RecvError {})),
             Err(TryRecvError::Empty) => {
                 // Insert this receive operation.
                 *opt_key = Some(wakers.insert(cx));
@@ -1029,5 +1030,19 @@ impl Display for TryRecvError {
             Self::Empty => Display::fmt("The channel is empty.", f),
             Self::Disconnected => Display::fmt("The channel is empty and disconnected.", f),
         }
+    }
+}
+
+/// An error returned from the `recv` method.
+#[cfg(feature = "unstable")]
+#[cfg_attr(feature = "docs", doc(cfg(unstable)))]
+#[derive(Debug)]
+pub struct RecvError;
+
+impl Error for RecvError {}
+
+impl Display for RecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt("The channel is empty.", f)
     }
 }
