@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://book.async.rs/overview
 
 ## [Unreleased]
 
+# [1.3.0] - 2019-12-12
+
+[API Documentation](https://docs.rs/async-std/1.3.0/async-std)
+
+This patch introduces `Stream::delay`, improves compile times, and fixes
+documentation bugs. `Stream::delay` is a new API that's similar to
+[`task::sleep`](https://docs.rs/async-std/1.2.0/async_std/task/fn.sleep.html),
+but can be passed as part of as stream, rather than as a separate block. This
+is useful for examples, or when manually debugging race conditions.
+
+## Examples
+
+```rust
+let start = Instant::now();
+let mut s = stream::from_iter(vec![0u8, 1]).delay(Duration::from_millis(200));
+
+// The first time will take more than 200ms due to delay.
+s.next().await;
+assert!(start.elapsed().as_millis() >= 200);
+
+// There will be no delay after the first time.
+s.next().await;
+assert!(start.elapsed().as_millis() <= 210);
+```
+
+## Added
+
+- Added `Stream::delay` as "unstable" [(#309)](https://github.com/async-rs/async-std/pull/309)
+
+## Changed
+
+- Removed our dependency on `async-macros`, speeding up compilation [(#610)](https://github.com/async-rs/async-std/pull/610)
+
+## Fixes
+
+- Fixed a link in the task docs [(#598)](https://github.com/async-rs/async-std/pull/598)
+- Fixed the `UdpSocket::recv` example [(#603)](https://github.com/async-rs/async-std/pull/603)
+- Fixed a link to `task::block_on` [(#608)](https://github.com/async-rs/async-std/pull/608)
+- Fixed an incorrect API mention in `task::Builder` [(#612)](https://github.com/async-rs/async-std/pull/612)
+- Fixed a leftover mentions of `futures-preview` [(#595)](https://github.com/async-rs/async-std/pull/595)
+
 # [1.2.0] - 2019-11-27
 
 [API Documentation](https://docs.rs/async-std/1.2.0/async-std)
@@ -553,7 +594,8 @@ task::blocking(async {
 
 - Initial beta release
 
-[Unreleased]: https://github.com/async-rs/async-std/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/async-rs/async-std/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/async-rs/async-std/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/async-rs/async-std/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/async-rs/async-std/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/async-rs/async-std/compare/v1.0.0...v1.0.1
