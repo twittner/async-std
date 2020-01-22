@@ -51,14 +51,14 @@ impl Reactor {
         };
 
         // Register a dummy I/O handle for waking up the polling thread.
-        let entry = reactor.register(&reactor.notify_reg.0)?;
+        let entry = reactor.register(&reactor.notify_reg.0, mio::PollOpt::edge())?;
         reactor.notify_token = entry.token;
 
         Ok(reactor)
     }
 
     /// Registers an I/O event source and returns its associated entry.
-    fn register(&self, source: &dyn Evented) -> io::Result<Arc<Entry>> {
+    fn register(&self, source: &dyn Evented, opts: mio::PollOpt) -> io::Result<Arc<Entry>> {
         let mut entries = self.entries.lock().unwrap();
 
         // Reserve a vacant spot in the slab and use its key as the token value.
@@ -75,10 +75,17 @@ impl Reactor {
 
         // Register the I/O event source in the poller.
         let interest = mio::Ready::all();
-        let opts = mio::PollOpt::edge();
         self.poller.register(source, token, interest, opts)?;
 
         Ok(entry)
+    }
+
+    /// Re-register a previously registered event source with the given option.
+    ///
+    /// This allows changing a registration from edge-triggered to level-triggered
+    /// and vice versa.
+    fn reregister(&self, source: &dyn Evented, entry: &Entry, opts: mio::PollOpt) -> io::Result<()> {
+        self.poller.reregister(source, entry.token, mio::Ready::all(), opts)
     }
 
     /// Deregisters an I/O event source associated with an entry.
@@ -174,22 +181,54 @@ pub struct Watcher<T: Evented> {
 }
 
 impl<T: Evented> Watcher<T> {
-    /// Creates a new I/O handle.
-    ///
-    /// The provided I/O event source will be kept registered inside the reactor's poller for the
-    /// lifetime of the returned I/O handle.
-    pub fn new(source: T) -> Watcher<T> {
+    fn new_with(source: T, opts: mio::PollOpt) -> Self {
         Watcher {
             entry: REACTOR
-                .register(&source)
+                .register(&source, opts)
                 .expect("cannot register an I/O event source"),
             source: Some(source),
         }
     }
 
+    /// Creates a new I/O handle.
+    ///
+    /// The provided I/O event source will be kept registered inside the reactor's poller for the
+    /// lifetime of the returned I/O handle.
+    pub fn new(source: T) -> Self {
+        Watcher::new_with(source, mio::PollOpt::edge())
+    }
+
+    /// Creates a new I/O handle with edge-triggered notification.
+    ///
+    /// The provided I/O event source will be kept registered inside the reactor's poller for the
+    /// lifetime of the returned I/O handle.
+    #[allow(dead_code)]
+    pub fn edge_triggered(source: T) -> Self {
+        Watcher::new(source)
+    }
+
+    /// Creates a new I/O handle with level-triggered notification.
+    ///
+    /// The provided I/O event source will be kept registered inside the reactor's poller for the
+    /// lifetime of the returned I/O handle.
+    pub fn level_triggered(source: T) -> Self {
+        Watcher::new_with(source, mio::PollOpt::level())
+    }
+
     /// Returns a reference to the inner I/O event source.
     pub fn get_ref(&self) -> &T {
         self.source.as_ref().unwrap()
+    }
+
+    /// Change this Waker's registration to be level-triggered.
+    #[allow(dead_code)]
+    pub fn set_level_triggered(&self) -> io::Result<()> {
+        REACTOR.reregister(self.get_ref(), self.entry.as_ref(), mio::PollOpt::level())
+    }
+
+    /// Change this Waker's registration to be edge-triggered.
+    pub fn set_edge_triggered(&self) -> io::Result<()> {
+        REACTOR.reregister(self.get_ref(), self.entry.as_ref(), mio::PollOpt::edge())
     }
 
     /// Polls the inner I/O source for a non-blocking read operation.
@@ -256,6 +295,25 @@ impl<T: Evented> Watcher<T> {
         }
 
         Poll::Pending
+    }
+
+    /// Register the given Context's `Waker` for wakeup when the I/O resource
+    /// becomes readable.
+    #[allow(dead_code)]
+    pub fn register_read_interest(&self, cx: &mut Context<'_>) {
+        let mut list = self.entry.readers.lock().unwrap();
+        if list.iter().all(|w| !w.will_wake(cx.waker())) {
+            list.push(cx.waker().clone());
+        }
+    }
+
+    /// Register the given Context's `Waker` for wakeup when the I/O resource
+    /// becomes writeable.
+    pub fn register_write_interest(&self, cx: &mut Context<'_>) {
+        let mut list = self.entry.writers.lock().unwrap();
+        if list.iter().all(|w| !w.will_wake(cx.waker())) {
+            list.push(cx.waker().clone());
+        }
     }
 
     /// Deregisters and returns the inner I/O source.
