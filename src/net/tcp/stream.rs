@@ -82,25 +82,40 @@ impl TcpStream {
             // or there was an error which we check for.
             match mio::net::TcpStream::connect(&addr) {
                 Ok(s) => {
-                    let mut w = Watcher::new_with(s, Interest::Write, Trigger::Level);
+                    let mut watcher = Watcher::new_with(s, Interest::Write, Trigger::Level);
                     let mut registered = false;
-                    future::poll_fn(|cx| {
-                        if registered {
-                            return Poll::Ready(())
+                    let mut spurious_wakeups = 0;
+                    let connected = future::poll_fn(|cx| {
+                        if !registered {
+                            watcher.notify_for(cx, Interest::Write);
+                            registered = true;
+                            return Poll::Pending
                         }
-                        w.notify_for(cx, Interest::Write);
-                        registered = true;
-                        Poll::Pending
+                        // The socket is now ready to write to, i.e. connected,
+                        // so we should be able to get the peer address. If not,
+                        // we have most likely been notified by a spurious event.
+                        if watcher.get_ref().peer_addr().is_err() {
+                            spurious_wakeups += 1;
+                            if spurious_wakeups > 15 {
+                                return Poll::Ready(Err(()))
+                            }
+                            return Poll::Pending
+                        }
+                        Poll::Ready(Ok(()))
                     })
                     .await;
 
-                    if let Err(e) = w.reconfigure(Interest::All, Trigger::Edge) {
+                    if connected.is_err() { // too many spurious wakeups
+                        continue
+                    }
+
+                    if let Err(e) = watcher.reconfigure(Interest::All, Trigger::Edge) {
                         last_err = Some(e);
                         continue
                     }
 
-                    match w.get_ref().take_error() {
-                        Ok(None) => return Ok(TcpStream { watcher: w }),
+                    match watcher.get_ref().take_error() {
+                        Ok(None) => return Ok(TcpStream { watcher }),
                         Ok(Some(e)) => last_err = Some(e),
                         Err(e) => last_err = Some(e)
                     }
