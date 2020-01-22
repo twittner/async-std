@@ -51,14 +51,14 @@ impl Reactor {
         };
 
         // Register a dummy I/O handle for waking up the polling thread.
-        let entry = reactor.register(&reactor.notify_reg.0)?;
+        let entry = reactor.register(&reactor.notify_reg.0, Interest::All, Trigger::Edge)?;
         reactor.notify_token = entry.token;
 
         Ok(reactor)
     }
 
     /// Registers an I/O event source and returns its associated entry.
-    fn register(&self, source: &dyn Evented) -> io::Result<Arc<Entry>> {
+    fn register(&self, source: &dyn Evented, interest: Interest, trigger: Trigger) -> io::Result<Arc<Entry>> {
         let mut entries = self.entries.lock().unwrap();
 
         // Reserve a vacant spot in the slab and use its key as the token value.
@@ -74,11 +74,14 @@ impl Reactor {
         vacant.insert(entry.clone());
 
         // Register the I/O event source in the poller.
-        let interest = mio::Ready::all();
-        let opts = mio::PollOpt::edge();
-        self.poller.register(source, token, interest, opts)?;
+        self.poller.register(source, token, interest.to_ready_set(), trigger.to_poll_opt())?;
 
         Ok(entry)
+    }
+
+    /// Re-register a previously registered event source with the given options.
+    fn reregister(&self, source: &dyn Evented, entry: &Entry, interest: Interest, trigger: Trigger) -> io::Result<()> {
+        self.poller.reregister(source, entry.token, interest.to_ready_set(), trigger.to_poll_opt())
     }
 
     /// Deregisters an I/O event source associated with an entry.
@@ -161,6 +164,47 @@ fn main_loop() -> io::Result<()> {
     }
 }
 
+/// The kind of readiness operation to be notified about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interest {
+    /// Notify about read readiness.
+    Read,
+    /// Notify about write readiness.
+    Write,
+    /// Notify about general readiness.
+    All
+}
+
+impl Interest {
+    /// Translate to mio's readiness set.
+    fn to_ready_set(self) -> mio::Ready {
+        match self {
+            Interest::Read => reader_interests(),
+            Interest::Write => writer_interests(),
+            Interest::All => mio::Ready::all()
+        }
+    }
+}
+
+/// The trigger that causes a readiness notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    /// Notify when the watched resource changes w.r.t. its interests.
+    Edge,
+    /// Notify as long as the watched resource matches the interests.
+    Level
+}
+
+impl Trigger {
+    /// Translate to mio's poll option.
+    fn to_poll_opt(self) -> mio::PollOpt {
+        match self {
+            Trigger::Edge => mio::PollOpt::edge(),
+            Trigger::Level => mio::PollOpt::level()
+        }
+    }
+}
+
 /// An I/O handle powered by the networking driver.
 ///
 /// This handle wraps an I/O event source and exposes a "futurized" interface on top of it,
@@ -171,6 +215,9 @@ pub struct Watcher<T: Evented> {
 
     /// The I/O event source.
     source: Option<T>,
+
+    /// The interest of this watcher.
+    interest: Interest
 }
 
 impl<T: Evented> Watcher<T> {
@@ -178,18 +225,40 @@ impl<T: Evented> Watcher<T> {
     ///
     /// The provided I/O event source will be kept registered inside the reactor's poller for the
     /// lifetime of the returned I/O handle.
-    pub fn new(source: T) -> Watcher<T> {
+    pub fn new(source: T) -> Self {
+        Watcher::new_with(source, Interest::All, Trigger::Edge)
+    }
+
+    /// Creates a new I/O handle.
+    ///
+    /// The provided I/O event source will be kept registered inside the reactor's poller for the
+    /// lifetime of the returned I/O handle.
+    ///
+    /// The watcher will be notified for the given `Interest` and `Trigger`.
+    ///
+    /// Make sure that the methods you call on this `Watcher` are consistent with the
+    /// given `Interest`. It makes no sense for example to register with `Interest::Write`
+    /// and call `poll_read_with` since the I/O resource is not watched for read readiness.
+    pub fn new_with(source: T, interest: Interest, trigger: Trigger) -> Self {
         Watcher {
             entry: REACTOR
-                .register(&source)
+                .register(&source, interest, trigger)
                 .expect("cannot register an I/O event source"),
             source: Some(source),
+            interest
         }
     }
 
     /// Returns a reference to the inner I/O event source.
     pub fn get_ref(&self) -> &T {
         self.source.as_ref().unwrap()
+    }
+
+    /// Change this Watcher's registration.
+    pub fn reconfigure(&mut self, interest: Interest, trigger: Trigger) -> io::Result<()> {
+        REACTOR.reregister(self.get_ref(), self.entry.as_ref(), interest, trigger)?;
+        self.interest = interest;
+        Ok(())
     }
 
     /// Polls the inner I/O source for a non-blocking read operation.
@@ -200,6 +269,8 @@ impl<T: Evented> Watcher<T> {
     where
         F: FnMut(&'a T) -> io::Result<R>,
     {
+        debug_assert!(self.interest == Interest::Read || self.interest == Interest::All);
+
         // If the operation isn't blocked, return its result.
         match f(self.source.as_ref().unwrap()) {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
@@ -235,6 +306,8 @@ impl<T: Evented> Watcher<T> {
     where
         F: FnMut(&'a T) -> io::Result<R>,
     {
+        debug_assert!(self.interest == Interest::Write || self.interest == Interest::All);
+
         // If the operation isn't blocked, return its result.
         match f(self.source.as_ref().unwrap()) {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
@@ -256,6 +329,25 @@ impl<T: Evented> Watcher<T> {
         }
 
         Poll::Pending
+    }
+
+    /// Notify the given Context's `Waker` when the I/O resource becomes
+    /// available for the given `Interest`.
+    pub fn notify_for(&self, cx: &mut Context<'_>, interest: Interest) {
+        if interest == Interest::Read || interest == Interest::All {
+            debug_assert!(self.interest == Interest::Read || self.interest == Interest::All);
+            let mut list = self.entry.readers.lock().unwrap();
+            if list.iter().all(|w| !w.will_wake(cx.waker())) {
+                list.push(cx.waker().clone());
+            }
+        }
+        if interest == Interest::Write || interest == Interest::All {
+            debug_assert!(self.interest == Interest::Write || self.interest == Interest::All);
+            let mut list = self.entry.writers.lock().unwrap();
+            if list.iter().all(|w| !w.will_wake(cx.waker())) {
+                list.push(cx.waker().clone());
+            }
+        }
     }
 
     /// Deregisters and returns the inner I/O source.
